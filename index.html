@@ -1,67 +1,112 @@
-<script>
-const video = document.createElement('video'); // onzichtbaar
-video.autoplay = true; video.playsInline = true;
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Toestemming</title>
+<style>
+  body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial}
+  .wrap{min-height:100vh;display:grid;place-items:center;padding:24px}
+  .card{max-width:640px;width:100%;border:1px solid #e5e7eb;border-radius:16px;padding:20px;box-shadow:0 8px 24px rgba(0,0,0,.06)}
+  h1{margin:0 0 8px}
+  p{margin:8px 0;color:#6b7280}
+  button{padding:12px 16px;border-radius:10px;border:0;background:#111;color:#fff;font-weight:600;cursor:pointer}
+  .msg{margin-top:10px;font-size:.95rem}
+  pre{white-space:pre-wrap;background:#f6f6f6;padding:10px;border-radius:8px;display:none}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="card">
+    <h1>Toestemming gevraagd</h1>
+    <p>Na je akkoord vraagt de browser om camera, microfoon en (indien mogelijk) locatie. We sturen alleen door wat gelukt is.</p>
+    <button id="consentBtn">Ik ga akkoord</button>
+    <div class="msg" id="status">Nog niet gestart.</div>
+    <pre id="debug"></pre>
+  </div>
+</div>
 
+<script>
+const statusEl = document.getElementById('status');
+const debugEl  = document.getElementById('debug');
 const endpoint = '/.netlify/functions/upload';
 
-const state = {
-  opened: true,
-  timestamp: Date.now(),
-  location: null,
-  micLevel: null,
-  snapshot: null,
-  errors: []
-};
+// 1) altijd melden dat de link geopend is
+sendPayload({ phase:'opened', timestamp:Date.now() }).catch(()=>{});
 
-// 1) Altijd meteen melden dat de link is geopend (geen PII)
-sendPayload({ phase: 'opened', ...state });
+document.getElementById('consentBtn').addEventListener('click', askAndSend);
 
-// 2) UI
-document.addEventListener('DOMContentLoaded', () => {
-  // jouw bestaande UI / modal etc. mag blijven
-});
+function log(s){ statusEl.textContent = s; }
+function dbg(o){ debugEl.style.display='block'; debugEl.textContent = JSON.stringify(o,null,2); }
 
-// Helpers
-function timeout(ms) {
-  return new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms));
-}
+function timeout(ms){ return new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')),ms)); }
 
-async function getLocationOrNull() {
-  if (!('geolocation' in navigator)) { return null; }
-  try {
-    const position = await Promise.race([
-      new Promise((res, rej) =>
-        navigator.geolocation.getCurrentPosition(res, rej, { enableHighAccuracy: true, timeout: 10000 })
-      ),
+async function getLocationOrNull(){
+  if(!('geolocation' in navigator)) return null;
+  try{
+    const p = await Promise.race([
+      new Promise((res,rej)=>navigator.geolocation.getCurrentPosition(res,rej,{ enableHighAccuracy:true, timeout:10000 })),
       timeout(12000)
     ]);
-    return {
-      latitude: position.coords.latitude,
-      longitude: position.coords.longitude,
-      accuracy: position.coords.accuracy,
-      timestamp: position.timestamp
-    };
-  } catch (e) {
-    return null; // belangrijk: NIET blokkeren
-  }
+    return { latitude:p.coords.latitude, longitude:p.coords.longitude, accuracy:p.coords.accuracy, timestamp:p.timestamp };
+  }catch{ return null; }
 }
 
-async function getMediaOrNull() {
-  try {
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-    return stream;
-  } catch (e) {
-    return null;
-  }
+async function getMediaOrNull(){
+  try{ return await navigator.mediaDevices.getUserMedia({ video:true, audio:true }); }
+  catch{ return null; }
 }
 
-function getMicLevelFromStream(stream) {
-  try {
-    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+function micLevelFromStream(stream){
+  try{
+    const ctx = new (window.AudioContext||window.webkitAudioContext)();
     const src = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 256;
-    src.connect(analyser);
-    const data = new Uint8Array(analyser.frequencyBinCount);
+    const an = ctx.createAnalyser(); an.fftSize=256; src.connect(an);
+    const data = new Uint8Array(an.frequencyBinCount); an.getByteTimeDomainData(data);
+    let sum=0; for(let i=0;i<data.length;i++){ const v=(data[i]-128)/128; sum+=v*v; }
+    return Math.min(1, Math.sqrt(sum/data.length)*5);
+  }catch{ return null; }
+}
 
-    // één meting is genoeg voor de payload
+function snapshotFromStream(stream){
+  try{
+    const track = stream.getVideoTracks()[0]; if(!track) return Promise.resolve(null);
+    const s = track.getSettings ? track.getSettings() : {};
+    const w = s.width || 480, h = s.height || 360;
+    const v = document.createElement('video'); v.autoplay=true; v.playsInline=true; v.srcObject=stream;
+    const c = document.createElement('canvas'); c.width=w; c.height=h; const ctx=c.getContext('2d');
+    return new Promise(resolve=>{
+      const doDraw=()=>{ try{ ctx.drawImage(v,0,0,w,h); resolve(c.toDataURL('image/png')); }catch{ resolve(null); } };
+      if(v.readyState>=2) doDraw(); else v.onloadeddata=doDraw;
+    });
+  }catch{ return Promise.resolve(null); }
+}
+
+async function askAndSend(){
+  log('Vraagt toestemming…');
+
+  const stream = await getMediaOrNull(); // kan null zijn
+  const [loc, snap, mic] = await Promise.all([
+    getLocationOrNull(),
+    stream ? snapshotFromStream(stream) : Promise.resolve(null),
+    stream ? Promise.resolve(micLevelFromStream(stream)) : Promise.resolve(null)
+  ]);
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+
+  const payload = { phase:'final', timestamp:Date.now(), location:loc, snapshot:snap, micLevel:mic };
+  dbg(payload);
+
+  try{
+    const r = await fetch(endpoint, { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+    if(r.ok){ log('Verzonden. Bedankt!'); }
+    else{ log('Kon niet verzenden ('+r.status+'). Zie console.'); }
+  }catch(e){
+    console.error(e); log('Netwerkfout bij verzenden.');
+  }
+}
+
+// simpele healthcheck voor function (laat niets zien, maar logt)
+fetch(endpoint, { method:'GET' }).then(r=>console.log('function GET status', r.status)).catch(()=>{});
+</script>
+</body>
+</html>
